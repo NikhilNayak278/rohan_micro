@@ -1,0 +1,51 @@
+openapi: 3.0.0
+info:
+  title: FHIR Harmonization Service
+  description: Microservice for mapping and harmonizing FHIR data.
+  version: 1.0.0
+servers:
+  - url: http://localhost:5000/api/v1
+    description: Local server
+paths:
+  /map:
+    post:
+      summary: Map legacy data to FHIR
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type: string
+                first_name:
+                  type: string
+                last_name:
+                  type: string
+                dob:
+                  type: string
+                  format: date
+                gender:
+                  type: string
+                blood_pressure:
+                  type: string
+      responses:
+        '200':
+          description: Standard FHIR Bundle
+          content:
+            application/json:
+              schema:
+                type: object
+  /harmonize:
+    post:
+      summary: Harmonize FHIR Bundle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Harmonized FHIR Bundle
