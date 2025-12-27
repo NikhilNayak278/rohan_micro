@@ -21,15 +21,27 @@ def map_data():
         data = request.get_json()
         if not data:
             return jsonify({'error': 'No data provided'}), 400
+        
+        logger.info(f"[/map] Received data: {json.dumps(data, indent=2)}")
             
         fhir_bundle = MappingService.map_legacy_to_fhir(data)
         # Parse back to dict for JSON response
-        return jsonify(json.loads(fhir_bundle)), 200
+        bundle_dict = json.loads(fhir_bundle)
+        
+        logger.info(f"[/map] Created bundle with {len(bundle_dict.get('entry', []))} entries")
+        for i, entry in enumerate(bundle_dict.get('entry', [])):
+            resource_type = entry.get('resource', {}).get('resourceType', 'Unknown')
+            logger.info(f"[/map] Entry {i}: {resource_type}")
+        
+        return jsonify(bundle_dict), 200
         
     except ValueError as e:
+        logger.error(f"ValueError in /map: {e}")
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         logger.error(f"Unexpected error in /map: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': 'Internal server error'}), 500
 
 @main_bp.route('/harmonize', methods=['POST'])

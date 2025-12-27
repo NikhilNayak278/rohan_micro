@@ -1,16 +1,18 @@
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from fhir.resources.patient import Patient
 from fhir.resources.humanname import HumanName
 from fhir.resources.bundle import Bundle, BundleEntry
-from fhir.resources.observation import Observation
+from fhir.resources.observation import Observation, ObservationComponent, ObservationReferenceRange
 from fhir.resources.condition import Condition
 from fhir.resources.codeableconcept import CodeableConcept
 from fhir.resources.medicationstatement import MedicationStatement
 from fhir.resources.dosage import Dosage
 from fhir.resources.procedure import Procedure
 from fhir.resources.encounter import Encounter
+from fhir.resources.quantity import Quantity
+from harmon_service.terminology import get_condition_code, get_loinc_code, get_rxnorm_code
 
 logger = logging.getLogger(__name__)
 
@@ -86,28 +88,35 @@ class MappingService:
                 all_conditions.append(diagnoses)
             
             for disease in all_conditions:
-                if disease:  # Skip empty strings
-                    condition = Condition.model_construct(
-                        id=str(uuid.uuid4()),
-                        subject={"reference": f"Patient/{patient.id}"},
-                        code=CodeableConcept.model_construct(text=disease),
-                        clinicalStatus=CodeableConcept.model_construct(
-                            coding=[{
-                                "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
-                                "code": "active"
-                            }]
-                        ),
-                        verificationStatus=CodeableConcept.model_construct(
-                            coding=[{
-                                "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
-                                "code": "confirmed"
-                            }]
+                try:
+                    if disease:  # Skip empty strings
+                        # Use terminology service to look up ICD-10 code
+                        concept_data = get_condition_code(disease)
+                        
+                        condition = Condition.model_construct(
+                            id=str(uuid.uuid4()),
+                            subject={"reference": f"Patient/{patient.id}"},
+                            code=CodeableConcept.model_construct(**concept_data),
+                            clinicalStatus=CodeableConcept.model_construct(
+                                coding=[{
+                                    "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                                    "code": "active"
+                                }]
+                            ),
+                            verificationStatus=CodeableConcept.model_construct(
+                                coding=[{
+                                    "system": "http://terminology.hl7.org/CodeSystem/condition-ver-status",
+                                    "code": "confirmed"
+                                }]
+                            )
                         )
-                    )
-                    bundle_entries.append(BundleEntry(resource=condition, request={'method': 'POST', 'url': 'Condition'}))
+                        bundle_entries.append(BundleEntry(resource=condition, request={'method': 'POST', 'url': 'Condition'}))
+                except Exception as e_item:
+                    logger.error(f"Skipping disease '{disease}' due to error: {e_item}")
+                    continue
             
             # =====================================
-            # 3. Map Medications to MedicationStatement
+            # 3. Map Medications to MedicationStatement (RXNORM INTEGRATED)
             # =====================================
             medications = legacy_data.get('Medication', [])
             dosages = legacy_data.get('Dosage', [])
@@ -120,20 +129,32 @@ class MappingService:
             
             if isinstance(medications, list):
                 for med, dose in zip(medications, dosages):
-                    if med:  # Skip empty strings
-                        # Prepare dosage
-                        dosage_list = None
-                        if dose:
-                            dosage_list = [Dosage.model_construct(text=dose)]
-                        
-                        med_statement = MedicationStatement.model_construct(
-                            id=str(uuid.uuid4()),
-                            subject={"reference": f"Patient/{patient.id}"},
-                            status="active",
-                            medicationCodeableConcept=CodeableConcept.model_construct(text=med),
-                            dosage=dosage_list
-                        )
-                        bundle_entries.append(BundleEntry(resource=med_statement, request={'method': 'POST', 'url': 'MedicationStatement'}))
+                    try:
+                        if med:  # Skip empty strings
+                            # Prepare dosage
+                            dosage_list = None
+                            if dose:
+                                dosage_list = [Dosage.model_construct(text=dose)]
+                            
+                            # Use RxNorm terminology service
+                            try:
+                                concept_data = get_rxnorm_code(med)
+                                med_code = CodeableConcept.model_construct(**concept_data)
+                            except Exception:
+                                # Fallback
+                                med_code = CodeableConcept.model_construct(text=med)
+
+                            med_statement = MedicationStatement.model_construct(
+                                id=str(uuid.uuid4()),
+                                subject={"reference": f"Patient/{patient.id}"},
+                                status="active",
+                                medicationCodeableConcept=med_code,
+                                dosage=dosage_list
+                            )
+                            bundle_entries.append(BundleEntry(resource=med_statement, request={'method': 'POST', 'url': 'MedicationStatement'}))
+                    except Exception as e_item:
+                        logger.error(f"Skipping medication '{med}' due to error: {e_item}")
+                        continue
             
             # =====================================
             # 4. Map Procedures
@@ -142,83 +163,131 @@ class MappingService:
             
             if isinstance(procedures, list):
                 for proc in procedures:
-                    if proc:  # Skip empty strings
-                        procedure = Procedure.model_construct(
-                            id=str(uuid.uuid4()),
-                            subject={"reference": f"Patient/{patient.id}"},
-                            status="completed",
-                            code=CodeableConcept.model_construct(text=proc)
-                        )
-                        bundle_entries.append(BundleEntry(resource=procedure, request={'method': 'POST', 'url': 'Procedure'}))
+                    if proc:
+                        try:
+                            procedure = Procedure.model_construct(
+                                id=str(uuid.uuid4()),
+                                subject={"reference": f"Patient/{patient.id}"},
+                                status="completed",
+                                code=CodeableConcept.model_construct(text=proc)
+                            )
+                            bundle_entries.append(BundleEntry(resource=procedure, request={'method': 'POST', 'url': 'Procedure'}))
+                        except Exception as e_item:
+                            logger.error(f"Skipping procedure '{proc}' due to error: {e_item}")
+                            continue
             
             # =====================================
-            # 5. Map Blood Pressure to Observation (EXISTING LOGIC - LABS ONLY)
+            # 5. Map Blood Pressure to Observation (LOINC 85354-9)
             # =====================================
             bp_raw = legacy_data.get('blood_pressure')
             if bp_raw:
                 try:
                     systolic, diastolic = bp_raw.split('/')
-                    observation = Observation.model_construct()
-                    observation.status = 'final'
-                    observation.code = {
-                        "coding": [{
-                            "system": "http://loinc.org",
-                            "code": "85354-9",
-                            "display": "Blood pressure panel with all children optional"
-                        }]
-                    }
-                    observation.subject = {"reference": f"Patient/{patient.id}"}
-                    observation.component = [
-                        {
-                            "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6", "display": "Systolic blood pressure"}]},
-                            "valueQuantity": {"value": float(systolic), "unit": "mmHg", "system": "http://unitsofmeasure.org", "code": "mm[Hg]"}
+                    
+                    obs_data = {
+                        "id": str(uuid.uuid4()),
+                        "status": "final",
+                        "code": {
+                            "coding": [{
+                                "system": "http://loinc.org",
+                                "code": "85354-9",
+                                "display": "Blood pressure panel with all children optional"
+                            }]
                         },
-                        {
-                            "code": {"coding": [{"system": "http://loinc.org", "code": "8462-4", "display": "Diastolic blood pressure"}]},
-                            "valueQuantity": {"value": float(diastolic), "unit": "mmHg", "system": "http://unitsofmeasure.org", "code": "mm[Hg]"}
-                        }
-                    ]
-                    observation.effectiveDateTime = datetime.utcnow().isoformat()
+                        "subject": {"reference": f"Patient/{patient.id}"},
+                        "component": [
+                            {
+                                "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6", "display": "Systolic blood pressure"}]},
+                                "valueQuantity": {"value": float(systolic), "unit": "mmHg", "system": "http://unitsofmeasure.org", "code": "mm[Hg]"}
+                            },
+                            {
+                                "code": {"coding": [{"system": "http://loinc.org", "code": "8462-4", "display": "Diastolic blood pressure"}]},
+                                "valueQuantity": {"value": float(diastolic), "unit": "mmHg", "system": "http://unitsofmeasure.org", "code": "mm[Hg]"}
+                            }
+                        ],
+                        "effectiveDateTime": datetime.now(timezone.utc).isoformat()
+                    }
+                    
+                    # Construct components carefully
+                    components = []
+                    for comp_data in obs_data["component"]:
+                        comp = ObservationComponent.model_construct(
+                            code=CodeableConcept.model_construct(**comp_data["code"]),
+                            valueQuantity=Quantity.model_construct(**comp_data["valueQuantity"])
+                        )
+                        components.append(comp)
+                    
+                    observation = Observation.model_construct(
+                        id=obs_data["id"],
+                        status=obs_data["status"],
+                        code=CodeableConcept.model_construct(**obs_data["code"]),
+                        subject=obs_data["subject"],
+                        component=components,
+                        effectiveDateTime=obs_data["effectiveDateTime"]
+                    )
+                    
                     bundle_entries.append(BundleEntry(resource=observation, request={'method': 'POST', 'url': 'Observation'}))
                 except ValueError:
                     logger.warning(f"Invalid blood pressure format: {bp_raw}")
+                except Exception as e_bp:
+                    logger.error(f"Error mapping blood pressure: {e_bp}")
             
             # =====================================
-            # 6. Map Lab Tests to Observation
+            # 6. Map Lab Tests to Observation (LOINC INTEGRATED)
             # =====================================
             lab_tests = legacy_data.get('Lab_Tests', [])
             
             if isinstance(lab_tests, list):
                 for test in lab_tests:
-                    if isinstance(test, dict) and test.get('Name'):
-                        observation = Observation.model_construct(
-                            id=str(uuid.uuid4()),
-                            subject={"reference": f"Patient/{patient.id}"},
-                            status="final",
-                            code=CodeableConcept.model_construct(text=test.get('Name')),
-                            effectiveDateTime=legacy_data.get('Date') or datetime.utcnow().isoformat()
-                        )
-                        
-                        # Add value if present
-                        value = test.get('Value')
-                        unit = test.get('Unit')
-                        if value:
+                    try:
+                        if isinstance(test, dict) and test.get('Name'):
+                            test_name = test.get('Name')
+                            
+                            # Dictionary construction for Observation
+                            obs_data = {
+                                "id": str(uuid.uuid4()),
+                                "subject": {"reference": f"Patient/{patient.id}"},
+                                "status": "final"
+                            }
+                            
+                            # Set observation code (LOINC lookup)
                             try:
-                                observation.valueQuantity = {
-                                    "value": float(value),
-                                    "unit": unit if unit else ""
-                                }
-                            except (ValueError, TypeError):
-                                observation.valueString = str(value)
-                        
-                        # Add reference range if present
-                        ref_range = test.get('Reference_Range')
-                        if ref_range:
-                            observation.referenceRange = [{
-                                "text": ref_range
-                            }]
-                        
-                        bundle_entries.append(BundleEntry(resource=observation, request={'method': 'POST', 'url': 'Observation'}))
+                                concept_data = get_loinc_code(test_name)
+                                obs_data["code"] = CodeableConcept.model_construct(**concept_data)
+                            except Exception:
+                                obs_data["code"] = CodeableConcept.model_construct(text=test_name)
+
+                            # Set effective date
+                            obs_data["effectiveDateTime"] = legacy_data.get('Date') or datetime.now(timezone.utc).isoformat()
+                            
+                            # Add value if present
+                            value = test.get('Value')
+                            unit = test.get('Unit')
+                            if value:
+                                try:
+                                    numeric_value = float(value)
+                                    qty = Quantity.model_construct()
+                                    qty.value = numeric_value
+                                    if unit:
+                                        qty.unit = unit
+                                    obs_data["valueQuantity"] = qty
+                                except (ValueError, TypeError):
+                                    # If not numeric, use valueString
+                                    obs_data["valueString"] = str(value)
+                            
+                            # Add reference range if present
+                            ref_range = test.get('Reference_Range')
+                            if ref_range:
+                                rr = ObservationReferenceRange.model_construct(text=ref_range)
+                                obs_data["referenceRange"] = [rr]
+                            
+                            # Construct Observation
+                            observation = Observation.model_construct(**obs_data)
+                            
+                            bundle_entries.append(BundleEntry(resource=observation, request={'method': 'POST', 'url': 'Observation'}))
+                    except Exception as e_item:
+                         logger.error(f"Skipping lab test '{test.get('Name', 'Unknown')}' due to error: {e_item}")
+                         continue
             
             # =====================================
             # 7. Map Encounter (Admission/Discharge)
@@ -266,3 +335,4 @@ class MappingService:
         except Exception as e:
             logger.error(f"Error mapping data: {e}")
             raise ValueError(f"Mapping failed: {str(e)}")
+

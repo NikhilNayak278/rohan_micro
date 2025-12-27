@@ -1,5 +1,28 @@
+
+# Python
 __pycache__/
 *.pyc
-.env
-.pytest_cache/
+*.pyo
+*.pyd
+.Python
+env/
 venv/
+.env
+.venv
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific
+output.txt
+debug_output.txt
+*.log

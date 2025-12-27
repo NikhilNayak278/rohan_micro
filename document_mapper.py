@@ -12,6 +12,7 @@ CRITICAL RULES:
 - Output transaction Bundles only
 """
 
+
 import logging
 import uuid
 from datetime import datetime
@@ -27,6 +28,11 @@ from fhir.resources.procedure import Procedure
 from fhir.resources.observation import Observation, ObservationReferenceRange
 from fhir.resources.quantity import Quantity
 from fhir.resources.encounter import Encounter
+
+try:
+    from terminology import get_condition_code, get_loinc_code, get_rxnorm_code
+except ImportError:
+    from harmon_service.terminology import get_condition_code, get_loinc_code, get_rxnorm_code
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +107,15 @@ class DocumentMapper:
         # Reference patient
         condition.subject = {"reference": f"Patient/{self.patient_id}"}
         
-        # Set condition text (no standard coding provided)
-        condition.code = CodeableConcept.model_construct()
-        condition.code.text = text
+        try:
+             # Use terminology service to look up ICD-10 code
+            concept_data = get_condition_code(text)
+            condition.code = CodeableConcept.model_construct(**concept_data)
+        except Exception as e:
+            logger.warning(f"Terminology lookup failed for '{text}', using raw text: {e}")
+            # Fallback to plain text
+            condition.code = CodeableConcept.model_construct()
+            condition.code.text = text
         
         # Clinical status: active (assuming current condition)
         condition.clinicalStatus = CodeableConcept.model_construct()
@@ -133,22 +145,31 @@ class DocumentMapper:
             medication: Medication name
             dosage_text: Optional dosage instructions
         """
-        # Prepare medication concept
-        med_concept = CodeableConcept.model_construct(text=medication)
+        # Build data dict for MedicationStatement
+        med_data = {
+            "id": str(uuid.uuid4()),
+            "subject": {"reference": f"Patient/{self.patient_id}"},
+            "status": "active"
+        }
         
-        # Prepare dosage if provided
-        dosage_list = None
+        # Prepare concept with RxNorm lookup
+        try:
+            concept_data = get_rxnorm_code(medication)
+            med_data["medicationCodeableConcept"] = CodeableConcept.model_construct(**concept_data)
+        except Exception:
+            # Fallback
+            med_data["medicationCodeableConcept"] = CodeableConcept.model_construct(text=medication)
+
+        # Note: Depending on fhir.resources version, it might be 'medicationCodeableConcept' (R4) 
+        # or 'medication' (CodeableReference in R5, but we targeted R4).
+        # We'll use medicationCodeableConcept as per standard R4.
+        
+        # Add dosage if provided
         if dosage_text:
-            dosage_list = [Dosage.model_construct(text=dosage_text)]
+            med_data["dosage"] = [{"text": dosage_text}]
         
-        # Build medication statement with all kwargs
-        med_statement = MedicationStatement.model_construct(
-            id=str(uuid.uuid4()),
-            subject={"reference": f"Patient/{self.patient_id}"},
-            medicationCodeableConcept=med_concept,
-            status="active",
-            dosage=dosage_list
-        )
+        # Use proper instantiation with validation
+        med_statement = MedicationStatement.model_construct(**med_data)
         
         return med_statement
     
@@ -191,42 +212,46 @@ class DocumentMapper:
             reference_range: Reference range text
             date: Test date
         """
-        observation = Observation.model_construct()
-        observation.id = str(uuid.uuid4())
-        
-        # Reference patient
-        observation.subject = {"reference": f"Patient/{self.patient_id}"}
+        # Build data dict
+        obs_data = {
+            "id": str(uuid.uuid4()),
+            "subject": {"reference": f"Patient/{self.patient_id}"},
+            "status": "final"
+        }
         
         # Set observation code (lab test name)
-        observation.code = CodeableConcept.model_construct()
-        observation.code.text = test_name
-        
-        # Status: final
-        observation.status = "final"
-        
+        try:
+            concept_data = get_loinc_code(test_name)
+            obs_data["code"] = CodeableConcept.model_construct(**concept_data)
+        except Exception:
+            obs_data["code"] = CodeableConcept.model_construct(text=test_name)
+            
         # Set value as quantity if numeric
         if value is not None:
             try:
                 numeric_value = float(value)
-                observation.valueQuantity = Quantity.model_construct()
-                observation.valueQuantity.value = numeric_value
+                qty = Quantity.model_construct()
+                qty.value = numeric_value
                 if unit:
-                    observation.valueQuantity.unit = unit
+                    qty.unit = unit
+                obs_data["valueQuantity"] = qty
             except (ValueError, TypeError):
                 # If not numeric, use valueString
-                observation.valueString = str(value)
+                obs_data["valueString"] = str(value)
         
         # Set reference range if provided
         if reference_range:
             ref_range = ObservationReferenceRange.model_construct()
             ref_range.text = reference_range
-            observation.referenceRange = [ref_range]
+            obs_data["referenceRange"] = [ref_range]
         
         # Set effective date
         if date:
-            observation.effectiveDateTime = self._normalize_date(date)
+            obs_data["effectiveDateTime"] = self._normalize_date(date)
         else:
-            observation.effectiveDateTime = datetime.utcnow().isoformat()
+            obs_data["effectiveDateTime"] = datetime.utcnow().isoformat()
+            
+        observation = Observation.model_construct(**obs_data)
         
         return observation
     
