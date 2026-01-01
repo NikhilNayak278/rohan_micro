@@ -22,6 +22,16 @@ def create_app(config_name=None):
     app.register_blueprint(main_bp)
 
     logger.info(f"FHIR Harmonization Service initialized in {config_name} mode")
+    
+    # Print all registered routes
+    logger.info("Registered Routes:")
+    for rule in app.url_map.iter_rules():
+        logger.info(f"{rule} -> {rule.endpoint}")
+        
+    @app.route('/test', methods=['GET'])
+    def test_route():
+        return "Test Route OK", 200
+        
     return app
 
 if __name__ == '__main__':

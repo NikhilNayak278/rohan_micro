@@ -7,7 +7,7 @@ class Config:
     DEBUG = False
     TESTING = False
     SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key')
-    PORT = int(os.environ.get('PORT', 5000))
+    PORT = int(os.environ.get('PORT', 5005))
 
 class DevelopmentConfig(Config):
     DEBUG = True

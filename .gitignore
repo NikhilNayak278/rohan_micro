@@ -26,3 +26,4 @@ htmlcov/
 output.txt
 debug_output.txt
 *.log
+exec.ps1
